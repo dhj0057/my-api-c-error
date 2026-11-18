@@ -1,13 +1,11 @@
-# 📋 main.py · 과제 — 나만의 AI API
-# ============================================================
-# 13주차 오늘의 과제 · 나만의 AI API (main.py)
-# ------------------------------------------------------------
-# · 키는 서버 환경 변수 GEMINI_API_KEY 로만 읽음 (Vercel → Settings → Environment Variables)
-# · 접근 코드는 환경 변수 APP_ACCESS_CODE — 부르는 쪽은 헤더 X-Access-Code 에 같은 값을 넣음
-#   ★ 이 파일 · GitHub 저장소에 키와 접근 코드를 절대 적지 않음
-# · POST /ask 한 번에 Gemini 요청 1번 (무료 한도 분당 15회)
-# ============================================================
+# 📋 main.py · [과제 백엔드] 나만의 멀티모달 API — 사진을 받아 정해 둔 칸(JSON)으로 정리 (Vercel 에 올릴 main.py · POST 한 번에 요청 1번)
+# · ★ (직접 작성) 표시가 붙은 곳만 내 주제로 바꾸면 됨 — 화면(app.py)은 고칠 곳 없음
+# · 키는 환경 변수 GEMINI_API_KEY · 접근 코드는 APP_ACCESS_CODE (코드 · 저장소에 적지 않음)
+import base64
+import binascii
+import json
 import os
+
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from google import genai
@@ -15,81 +13,83 @@ from google.genai import types
 
 MODEL_NAME = "gemini-3.5-flash-lite"
 
-# ① API 이름 · 한 줄 소개
-APP_TITLE = "C 오류 해설 API"
-APP_DESCRIPTION = "C 언어를 처음 배우는 대학생에게 컴파일 오류 · 실행 오류의 뜻과 고치는 법을 알려 주는 AI API"
+# ★ (직접 작성) ① 서비스 이름 · 아이콘 · 한 줄 소개 — 화면이 GET / 로 받아 제목으로 씀
+APP_TITLE = "C 오류 화면 해설 도우미"
+APP_ICON = "🐞"
+APP_DESCRIPTION = "C 컴파일 · 실행 오류가 뜬 화면을 찍으면 오류 메시지 · 위치 · 뜻 · 원인 · 고치는 법을 정리해 줍니다"
 
-# ② 시스템 프롬프트 — 설계표 여섯 칸 (이름 · 역할 / 말투 / 할 일 / 하지 않을 일 / 모를 때 / 개인정보)
-#    ※ {tone} 외에는 중괄호를 쓰지 않음 (format 이 오류를 냄)
-SYSTEM_PROMPT = """너는 'C오류봇'이야. C 언어를 처음 배우는 대학생에게 컴파일 오류와 실행 오류를 풀이해 주는 도우미야.
-규칙 1. {tone} 말투로 4문장 이내로 답한다.
-규칙 2. 오류 메시지의 뜻 · 흔한 원인 · 고치는 방법을 순서대로 알려 준다.
-규칙 3. C 언어 · 프로그래밍과 관련 없는 질문에는 '저는 C 오류 도우미라서 그 질문에는 답하기 어려워요.' 라고 답한다. 과제 코드를 통째로 대신 써 주지 않는다.
-규칙 4. 코드 일부만 보고는 원인을 알 수 없으면 지어내지 말고, 오류 메시지 전체와 해당 줄을 함께 보내 달라고 안내한다.
-규칙 5. 이름 · 학번 · 전화번호 같은 개인정보를 묻지 않는다."""
+# ★ (직접 작성) ② 사진을 보고 할 일 — 역할 · 할 일 · 모를 때
+PROMPT = """너는 C 언어를 처음 배우는 대학생을 돕는 'C오류봇' 이야.
+사진은 C 코드의 컴파일 오류나 실행 오류가 보이는 화면(터미널 · IDE)이야.
+화면에 보이는 첫 번째 오류를 골라 아래 칸을 한국어로 짧게 채워. 오류 메시지는 화면 글자 그대로 옮겨.
+화면에서 읽을 수 없거나 판단할 근거가 없는 칸은 지어내지 말고 '확인 불가' 라고 적어.
+C 오류 화면이 아니면 모든 칸에 'C 오류 화면이 아님' 이라고 적어.
+과제 코드 전체를 대신 써 주지 말고, 고칠 줄만 알려 줘."""
 
-# ③ 예시 질문 3개 (GET /examples 가 돌려줌)
-EXAMPLE_QUESTIONS = [
-    "segmentation fault 가 뭐야?",
-    "expected ';' before 'return' 오류는 왜 나와?",
-    "scanf 에서 & 를 빼면 왜 안 돼?",
-]
+# ★ (직접 작성) ③ 결과로 받을 칸 이름 : 설명 (3~5개)
+FIELDS = {
+    "오류 메시지": "화면에 보이는 첫 번째 오류 메시지 (화면 글자 그대로)",
+    "위치": "파일 이름 · 줄 번호 (예: main.c 5번째 줄)",
+    "뜻": "오류 메시지를 쉬운 한국어로 한 문장",
+    "원인": "이 오류가 난 까닭 한 문장",
+    "고치는 법": "고칠 줄과 고친 모습 한두 문장",
+}
 
+SCHEMA = {"type": "object", "properties": {name: {"type": "string", "description": text} for name, text in FIELDS.items()},
+          "required": list(FIELDS)}
 app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION)
 
 
-class AskRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=300, description="질문")
-    tone: str = Field(default="친근한 존댓말", max_length=20, description="답의 말투")
+class PhotoRequest(BaseModel):
+    image_b64: str = Field(min_length=1, max_length=4_000_000, description="사진(JPEG)을 base64 로 바꾼 글자")
 
 
-class AskReply(BaseModel):
-    question: str
-    answer: str
+class Result(BaseModel):
+    result: dict[str, str]
     tokens: int | None = None
 
 
 def check_access(access_code):
-    """APP_ACCESS_CODE 가 정해져 있으면, 헤더의 접근 코드가 같아야만 통과"""
     expected = os.environ.get("APP_ACCESS_CODE")
     if expected and access_code != expected:
         raise HTTPException(status_code=401, detail="접근 코드가 틀렸습니다 — 헤더 X-Access-Code 를 확인하세요")
 
 
 def get_client():
-    """키는 서버의 환경 변수 GEMINI_API_KEY 에서 읽음"""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=503, detail="서버에 GEMINI_API_KEY 가 없습니다 — 환경 변수를 확인하세요")
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=60_000, retry_options=types.HttpRetryOptions(http_status_codes=[500, 503])),
+        http_options=types.HttpOptions(timeout=120_000, retry_options=types.HttpRetryOptions(http_status_codes=[500, 503])),
     )
 
 
 @app.get("/")
 def home():
-    return {"name": APP_TITLE, "description": APP_DESCRIPTION, "how_to_use": "POST /ask 에 {\"question\": \"…\"} 를 보내세요. 자세한 사용법은 /docs"}
+    """화면이 제목 · 아이콘 · 소개 · 칸 이름을 가져가는 주소 (요청 없음)"""
+    return {"name": APP_TITLE, "icon": APP_ICON, "description": APP_DESCRIPTION, "fields": list(FIELDS)}
 
 
-@app.get("/examples")
-def examples():
-    return {"examples": EXAMPLE_QUESTIONS}
-
-
-@app.post("/ask", response_model=AskReply)
-def ask(request: AskRequest, x_access_code: str | None = Header(default=None)):
+@app.post("/analyze", response_model=Result)
+def analyze(request: PhotoRequest, x_access_code: str | None = Header(default=None)):
     check_access(x_access_code)
+    try:
+        base64.b64decode(request.image_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(status_code=422, detail="base64 글자가 아닙니다")
     client = get_client()
     try:
         reply = client.interactions.create(
             model=MODEL_NAME, store=False,
-            system_instruction=SYSTEM_PROMPT.format(tone=request.tone),
-            input=request.question,
+            input=[{"type": "text", "text": PROMPT}, {"type": "image", "data": request.image_b64, "mime_type": "image/jpeg"}],
+            response_format={"type": "text", "mime_type": "application/json", "schema": SCHEMA},
         )
     except Exception as error:
         code = getattr(error, "status_code", None)
-        if code == 429:
-            raise HTTPException(status_code=429, detail="Gemini 무료 한도를 넘었습니다 — 1분 뒤 다시 요청하세요")
-        raise HTTPException(status_code=502, detail=f"Gemini 요청 실패 (상태 번호 {code})")
-    return AskReply(question=request.question, answer=reply.output_text, tokens=reply.usage.total_tokens)
+        raise HTTPException(status_code=429 if code == 429 else 502, detail=f"Gemini 요청 실패 (상태 번호 {code})")
+    try:
+        result = json.loads(reply.output_text)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="답이 JSON 모양이 아닙니다 — 다시 보내 보세요")
+    return Result(result={name: str(result.get(name, "")) for name in FIELDS}, tokens=reply.usage.total_tokens)
